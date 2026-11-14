@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 GRAVITY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$GRAVITY_DIR/../lerobot/src${PYTHONPATH:+:$PYTHONPATH}"
 if [[ -n "${B601_GRAVITY_PYTHON:-}" ]]; then
   GRAVITY_PYTHON="$B601_GRAVITY_PYTHON"
 else

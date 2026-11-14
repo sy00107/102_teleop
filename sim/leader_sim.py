@@ -18,7 +18,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -597,27 +597,21 @@ def main():
         os.environ.setdefault("MUJOCO_GL", "osmesa")
     sim = Simulation(args.roll, args.pitch, not args.no_gravity_comp)
     leader = robot = plant = None
+    viewer_threads = []
     try:
-        if not args.demo:
-            leader = Leader(args.port, args.calibration)
-        leader_action = demo_action(0) if leader is None else leader.latest()[0]
-        if args.start_at_leader:
-            sim.set_action(leader_action, initialize=True)
-        else:
-            sim.set_action({**dict.fromkeys(ARM, 0.0), "gripper": 0.0}, initialize=True)
-        plant = SimPlant(
-            sim, args.bus_delay_ms, watchdog_ms=250, vel_delay_ms=args.vel_delay_ms, vel_spike=args.vel_spike
-        )
-        robot = make_follower(sim, plant, args)
         viewer_context = nullcontext(None)
         if not args.headless:
             import mujoco.viewer
 
+            previous_threads = set(threading.enumerate())
             viewer_context = mujoco.viewer.launch_passive(
                 sim.model, sim.data, show_left_ui=False, show_right_ui=False
             )
-        with viewer_context as viewer:
-            plant.viewer = viewer
+            viewer_threads = [
+                thread for thread in threading.enumerate()
+                if thread not in previous_threads and "_launch_internal" in thread.name
+            ]
+        with viewer_context as viewer, ExitStack() as viewer_cleanup:
             if viewer:
                 with viewer.lock():
                     viewer.opt.geomgroup[3] = 0
@@ -625,6 +619,24 @@ def main():
                     viewer.cam.distance = 1.65
                     viewer.cam.azimuth = 180
                     viewer.cam.elevation = -15
+            # GUI initialization can pause Python longer than the 250 ms watchdog.
+            # Open it before starting the leader reader or enabling the simulated motors.
+            if not args.demo:
+                leader = Leader(args.port, args.calibration)
+            leader_action = demo_action(0) if leader is None else leader.latest()[0]
+            with viewer.lock() if viewer else nullcontext():
+                if args.start_at_leader:
+                    sim.set_action(leader_action, initialize=True)
+                else:
+                    sim.set_action({**dict.fromkeys(ARM, 0.0), "gripper": 0.0}, initialize=True)
+            plant = SimPlant(
+                sim, args.bus_delay_ms, watchdog_ms=250,
+                vel_delay_ms=args.vel_delay_ms, vel_spike=args.vel_spike,
+            )
+            plant.viewer = viewer
+            # Stop the physics thread before the viewer destroys its native resources.
+            viewer_cleanup.callback(plant.close)
+            robot = make_follower(sim, plant, args)
             print(
                 f"{'DEMO' if leader is None else 'LIVE ARM 102'} | roll={args.roll:g} | "
                 f"gravity FF={not args.no_gravity_comp} | comm-loss={args.comm_loss} | "
@@ -663,7 +675,7 @@ def main():
                     print(f"LEADER LOST: {reason}", flush=True)
                     if not silent:
                         robot.on_comm_loss(reason)  # same call the teleop loop makes
-                if not lost and action is not None:
+                if not lost and not latched and action is not None:
                     leader_action = action
                     try:
                         robot.send_action({f"{n}.pos": float(v) for n, v in action.items()})
@@ -732,6 +744,10 @@ def main():
             plant.close()
         if leader:
             leader.close()
+        # MuJoCo's passive viewer closes asynchronously. Let its render thread finish
+        # destroying the window before Python's GLFW termination handler runs.
+        for thread in viewer_threads:
+            thread.join()
         if args.status.exists():
             status = json.loads(args.status.read_text())
             status["running"] = False
