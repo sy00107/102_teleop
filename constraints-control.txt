@@ -1,0 +1,6 @@
+# 원본 PC의 제어·모델 계산 버전. Linux x86_64 / Python 3.12 기준.
+motorbridge==0.5.6
+motorbridge-smart-servo==0.0.4
+pin==4.0.0
+numpy==2.2.6
+mujoco==3.17.0
