@@ -8,12 +8,11 @@ if [[ -z "$CAMERAS" && "${ALLOW_STATE_ONLY_RECORDING:-0}" != "1" ]]; then
   echo "관절 정보만 기록하는 점검이면 ALLOW_STATE_ONLY_RECORDING=1로 설정하세요." >&2
   exit 1
 fi
-python "$YOIDLE_ROOT/scripts/preflight.py" --record
 
 DATASET_ROOT="$YOIDLE_HOME/datasets/$DATASET_NAME"
 mkdir -p "$YOIDLE_HOME/datasets"
 
-lerobot-record \
+run_with_diagnostics --preflight "$YOIDLE_ROOT/scripts/preflight.py" --record -- lerobot-record \
   "${ROBOT_ARGS[@]}" "${TELEOP_ARGS[@]}" \
   --dataset.repo_id="local/$DATASET_NAME" \
   --dataset.root="$DATASET_ROOT" \

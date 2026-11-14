@@ -1,5 +1,5 @@
 diff --git a/src/lerobot/robots/rebot_b601_follower/config_rebot_b601_follower.py b/src/lerobot/robots/rebot_b601_follower/config_rebot_b601_follower.py
-index 5c41cd28..8dd6fc90 100644
+index 5c41cd28..f06ecd37 100644
 --- a/src/lerobot/robots/rebot_b601_follower/config_rebot_b601_follower.py
 +++ b/src/lerobot/robots/rebot_b601_follower/config_rebot_b601_follower.py
 @@ -14,6 +14,7 @@
@@ -10,7 +10,7 @@ index 5c41cd28..8dd6fc90 100644
  from dataclasses import dataclass, field
  
  from lerobot.cameras import CameraConfig
-@@ -72,9 +73,114 @@ class RebotB601FollowerConfig:
+@@ -72,9 +73,118 @@ class RebotB601FollowerConfig:
      # Soft limits in public joint degrees.
      joint_limits: dict[str, tuple[float, float]] | None = None
  
@@ -66,6 +66,8 @@ index 5c41cd28..8dd6fc90 100644
 +    # Directory for a 10 Hz CSV black box (target, position, velocity, expected torque per joint).
 +    # Empty disables it. Written by the motor loop, so it survives a crashed/killed session.
 +    telemetry_dir: str | None = None
++    diagnostic_pre_seconds: float = 10.0
++    diagnostic_post_seconds: float = 5.0
 +    hard_temperature_c: float = 85.0
 +    # DM reports normal status as 0 (disabled) / 1 (enabled).
 +    feedback_probe_interval_s: float = 0.05
@@ -97,6 +99,8 @@ index 5c41cd28..8dd6fc90 100644
 +            "home_acceleration_deg_s2",
 +            "gripper_max_velocity_deg_s",
 +            "gripper_max_acceleration_deg_s2",
++            "diagnostic_pre_seconds",
++            "diagnostic_post_seconds",
 +        ):
 +            value = getattr(self, name)
 +            if not math.isfinite(value) or value <= 0:
@@ -125,6 +129,305 @@ index 5c41cd28..8dd6fc90 100644
          profile = MOTOR_PROFILES[self.motor_family]
          joints = tuple(profile.motor_models)
  
+diff --git a/src/lerobot/robots/rebot_b601_follower/diagnostics.py b/src/lerobot/robots/rebot_b601_follower/diagnostics.py
+new file mode 100644
+index 00000000..29f6e94b
+--- /dev/null
++++ b/src/lerobot/robots/rebot_b601_follower/diagnostics.py
+@@ -0,0 +1,293 @@
++# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
++# Licensed under the Apache License, Version 2.0 (the "License").
++"""Bounded, best-effort diagnostics. Only the writer thread touches the filesystem.
++
++A successful transport call is NOT a motor acknowledgement. MotorBridge 0.5.6
++has no per-sample RX timestamp/sequence; callers must record those as unknown.
++"""
++
++from __future__ import annotations
++
++import csv
++import hashlib
++import json
++import logging
++import math
++import os
++import platform
++import queue
++import threading
++import time
++import uuid
++from collections import deque
++from contextlib import suppress
++from pathlib import Path
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++
++def _json_safe(value: Any) -> Any:
++    if isinstance(value, float) and not math.isfinite(value):
++        return {"nonfinite": str(value)}
++    if isinstance(value, dict):
++        return {str(k): _json_safe(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_json_safe(v) for v in value]
++    if value is None or isinstance(value, (str, int, float, bool)):
++        return value
++    return str(value)
++
++
++def _line(value: Any) -> str:
++    return json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
++
++
++class DiagnosticsRecorder:
++    """Memory and queue sizes are finite; overflow loses diagnostics, never blocks motion.
++
++    emit payloads must be caller-owned snapshots, not mutable motor-state objects.
++    Pre/post windows can be shorter if the record limit is reached, the process
++    exits, or storage fails. Manifests expose loss and incomplete windows.
++    """
++
++    def __init__(
++        self,
++        folder: str | Path,
++        *,
++        metadata: dict[str, Any] | None = None,
++        pre_seconds: float = 10.0,
++        post_seconds: float = 5.0,
++        buffer_records: int = 8192,
++        queue_records: int = 4096,
++        rotation_bytes: int = 32 * 1024 * 1024,
++        keep_files: int = 4,
++    ):
++        self.folder = Path(folder).expanduser()
++        self.pre_seconds, self.post_seconds = pre_seconds, post_seconds
++        self._history: deque = deque(maxlen=buffer_records)
++        self._queue: queue.Queue = queue.Queue(maxsize=queue_records)
++        self._incidents: list[dict] = []
++        self._lock = threading.Lock()
++        self._stop = threading.Event()
++        self._seq = 0
++        self.rotation_bytes, self.keep_files = rotation_bytes, keep_files
++        self.metadata = metadata or {}
++        self.dropped_records = 0
++        self.buffer_evictions = 0
++        self.dropped_incidents = 0
++        self.closed = False
++        self.error: str | None = None
++        self._thread = threading.Thread(target=self._run, name="b601-diagnostics", daemon=True)
++        self._thread.start()
++
++    def emit(self, kind: str, payload: dict[str, Any]) -> None:
++        # No formatting, console output, filesystem access, or blocking queue put.
++        try:
++            with self._lock:
++                self._emit_locked(kind, payload)
++        except Exception:
++            self.dropped_records += 1
++
++    def _emit_locked(self, kind: str, payload: dict[str, Any]) -> dict:
++        now = time.monotonic_ns()
++        self._seq += 1
++        record = {
++            "seq": self._seq,
++            "mono_ns": now,
++            "wall_ns": time.time_ns(),
++            "kind": kind,
++            "thread": threading.current_thread().name,
++            "data": payload,
++        }
++        cutoff = now - int(self.pre_seconds * 1e9)
++        while self._history and self._history[0]["mono_ns"] < cutoff:
++            self._history.popleft()
++        if len(self._history) == self._history.maxlen:
++            self.buffer_evictions += 1
++        self._history.append(record)
++        for incident in self._incidents:
++            if now <= incident["deadline_ns"]:
++                if len(incident["post"]) == incident["post"].maxlen:
++                    incident["post_evictions"] += 1
++                incident["post"].append(record)
++        try:
++            self._queue.put_nowait(record)
++        except queue.Full:
++            self.dropped_records += 1
++        return record
++
++    def trigger(self, code: str, payload: dict[str, Any]) -> None:
++        try:
++            with self._lock:
++                incident_id = uuid.uuid4().hex[:12]
++                record = self._emit_locked("fault", {"code": code, "incident_id": incident_id, **payload})
++                if len(self._incidents) >= 8:
++                    self.dropped_incidents += 1
++                    return
++                self._incidents.append(
++                    {
++                        "id": incident_id,
++                        "code": code,
++                        "trigger_ns": record["mono_ns"],
++                        "deadline_ns": record["mono_ns"] + int(self.post_seconds * 1e9),
++                        "pre": list(self._history),
++                        "post": deque(maxlen=self._history.maxlen),
++                        "post_evictions": 0,
++                        "pre_written": False,
++                        "buffer_evictions_at_trigger": self.buffer_evictions,
++                    }
++                )
++        except Exception:
++            self.dropped_incidents += 1
++
++    def status(self) -> dict[str, Any]:
++        with self._lock:
++            return {
++                "dropped_trace_records": self.dropped_records,
++                "buffer_evictions": self.buffer_evictions,
++                "dropped_incidents": self.dropped_incidents,
++                "pending_incidents": len(self._incidents),
++                "writer_error": self.error,
++                "writer_alive": self._thread.is_alive(),
++                "queue_capacity": self._queue.maxsize,
++                "buffer_capacity": self._history.maxlen,
++            }
++
++    def close(self, timeout: float = 2.0) -> None:
++        self._stop.set()
++        self._thread.join(timeout=timeout)
++        self.closed = not self._thread.is_alive()
++        if not self.closed:
++            logger.warning(
++                "Diagnostics writer did not finish; logs may be incomplete. Motor cleanup continues."
++            )
++
++    def _ready_incidents(self) -> list[dict]:
++        now = time.monotonic_ns()
++        with self._lock:
++            ready = [i for i in self._incidents if self._stop.is_set() or now >= i["deadline_ns"]]
++            self._incidents = [i for i in self._incidents if i not in ready]
++        return ready
++
++    def _write_incident(self, incident: dict, *, partial: bool = False) -> None:
++        records = incident["pre"] + list(incident["post"])
++        info = {k: v for k, v in incident.items() if k not in ("pre", "post")}
++        info.update(
++            {
++                "kind": "incident_manifest",
++                "requested_pre_s": self.pre_seconds,
++                "requested_post_s": self.post_seconds,
++                "post_window_complete": not partial and time.monotonic_ns() >= incident["deadline_ns"],
++                "available_pre_s": (incident["trigger_ns"] - records[0]["mono_ns"]) / 1e9,
++                "last_record_ns": records[-1]["mono_ns"],
++                **self.status(),
++            }
++        )
++        suffix = ".partial" if partial else ""
++        target = self.folder / "incidents" / f"incident_{incident['id']}{suffix}.jsonl"
++        temporary = target.with_suffix(".tmp")
++        with temporary.open("w", encoding="utf-8") as stream:
++            stream.write(_line(info))
++            for record in records:
++                stream.write(_line(record))
++        temporary.replace(target)
++        if not partial:
++            partial_path = target.with_name(f"incident_{incident['id']}.partial.jsonl")
++            if partial_path.exists():
++                partial_path.unlink()
++
++    def _write_pending_pre(self) -> None:
++        with self._lock:
++            pending = [{**i, "post": []} for i in self._incidents if not i["pre_written"]]
++            for i in self._incidents:
++                i["pre_written"] = True
++        for incident in pending:
++            self._write_incident(incident, partial=True)
++
++    def _write_manifest(self, *, finished: bool) -> None:
++        manifest = {
++            "schema": 1,
++            "finished": finished,
++            "python": platform.python_version(),
++            "pid": os.getpid(),
++            "metadata": self.metadata,
++            **self.status(),
++            "motor_rx_timestamp_available": False,
++            "transport_success_is_execution_ack": False,
++            "trace_retention": {"rotation_bytes": self.rotation_bytes, "keep_files": self.keep_files},
++        }
++        temporary = self.folder / "manifest.tmp"
++        temporary.write_text(_line(manifest), encoding="utf-8")
++        temporary.replace(self.folder / "manifest.json")
++
++    def _run(self) -> None:
++        trace = events = telemetry = None
++        try:
++            self.folder.mkdir(parents=True, exist_ok=True)
++            (self.folder / "incidents").mkdir(exist_ok=True)
++            source_hashes = {}
++            for filename in self.metadata.get("source_files", []):
++                source_hashes[filename] = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
++            self.metadata["source_sha256"] = source_hashes
++            self._write_manifest(finished=False)
++            events = (self.folder / "events.jsonl").open("a", encoding="utf-8", buffering=1)
++            telemetry = (self.folder / time.strftime("b601_%Y%m%d_%H%M%S.csv")).open(
++                "w", encoding="utf-8", newline="", buffering=1
++            )
++            csv_writer = csv.writer(telemetry)
++            csv_header = False
++            trace_index, trace_bytes = 0, 0
++            trace = (self.folder / "trace_000000.jsonl").open("w", encoding="utf-8", buffering=1)
++            last_status = time.monotonic()
++            while not self._stop.is_set() or not self._queue.empty():
++                try:
++                    record = self._queue.get(timeout=0.02)
++                except queue.Empty:
++                    record = None
++                if record is not None:
++                    line = _line(record)
++                    size = len(line.encode("utf-8"))
++                    if trace_bytes and trace_bytes + size > self.rotation_bytes:
++                        trace.close()
++                        trace_index += 1
++                        trace = (self.folder / f"trace_{trace_index:06d}.jsonl").open(
++                            "w", encoding="utf-8", buffering=1
++                        )
++                        trace_bytes = 0
++                        expired = self.folder / f"trace_{trace_index - self.keep_files:06d}.jsonl"
++                        if expired.exists():
++                            expired.unlink()
++                    trace.write(line)
++                    trace_bytes += size
++                    if record["kind"] in ("fault", "state", "session", "parameter_probe_error"):
++                        events.write(line)
++                    if record["kind"] == "telemetry":
++                        if not csv_header:
++                            csv_writer.writerow(record["data"]["columns"])
++                            csv_header = True
++                        csv_writer.writerow(record["data"]["row"])
++                self._write_pending_pre()
++                for incident in self._ready_incidents():
++                    self._write_incident(incident)
++                if time.monotonic() - last_status >= 1.0:
++                    marker = self.folder / "mark_incident"
++                    if marker.exists():
++                        note = marker.read_text(encoding="utf-8")[:1000]
++                        marker.unlink()
++                        self.trigger("manual_marker", {"note": note})
++                    self._write_manifest(finished=False)
++                    last_status = time.monotonic()
++            for incident in self._ready_incidents():
++                self._write_incident(incident)
++            self._write_manifest(finished=True)
++        except Exception as error:
++            self.error = f"{type(error).__name__}: {error}"
++            logger.error(
++                "DIAGNOSTICS STORAGE FAILED; motor policy unchanged; evidence may be lost: %s", self.error
++            )
++        finally:
++            for stream in (trace, events, telemetry):
++                if stream is not None:
++                    with suppress(Exception):
++                        stream.close()
 diff --git a/src/lerobot/robots/rebot_b601_follower/gravity.py b/src/lerobot/robots/rebot_b601_follower/gravity.py
 new file mode 100644
 index 00000000..a1c88d6d
@@ -325,35 +628,38 @@ index 00000000..3c838a42
 +    if metadata["gravity_urdf"]:
 +        (folder / "b601_gravity_model.urdf").write_bytes(Path(metadata["gravity_urdf"]).read_bytes())
 diff --git a/src/lerobot/robots/rebot_b601_follower/rebot_b601_follower.py b/src/lerobot/robots/rebot_b601_follower/rebot_b601_follower.py
-index 468280d1..fb8b4aa5 100644
+index 468280d1..1af5026f 100644
 --- a/src/lerobot/robots/rebot_b601_follower/rebot_b601_follower.py
 +++ b/src/lerobot/robots/rebot_b601_follower/rebot_b601_follower.py
-@@ -14,10 +14,14 @@
+@@ -14,10 +14,16 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  
 +import hashlib
  import logging
  import math
++import os
 +import sys
 +import threading
  import time
++import traceback
  from functools import cached_property
 +from pathlib import Path
  from typing import TYPE_CHECKING, Any, cast
  
  from lerobot.cameras import DepthCamera, make_cameras_from_configs
-@@ -28,8 +32,8 @@ from lerobot.utils.errors import DeviceNotConnectedError
+@@ -28,8 +34,9 @@ from lerobot.utils.errors import DeviceNotConnectedError
  from lerobot.utils.import_utils import _motorbridge_available, require_package
  
  from ..robot import Robot
 -from ..utils import ensure_safe_goal_position
  from .config_rebot_b601_follower import RebotB601FollowerRobotConfig
++from .diagnostics import DiagnosticsRecorder
 +from .gravity import GravityCompensator
  from .motor_family import (
      GRIPPER_MOTOR,
      MOTOR_PROFILES,
-@@ -58,6 +62,9 @@ _GRIPPER_LPF_ALPHA = 0.3
+@@ -58,6 +65,9 @@ _GRIPPER_LPF_ALPHA = 0.3
  _GRIPPER_TARGET_VEL_MAX = 3.0
  _GRIPPER_HOLD_VEL_THRESHOLD = 0.25
  
@@ -363,7 +669,7 @@ index 468280d1..fb8b4aa5 100644
  
  class RebotB601Follower(Robot):
      """Seeed Studio reBot B601 follower arm (6-DOF + gripper, CAN motors).
-@@ -69,6 +76,7 @@ class RebotB601Follower(Robot):
+@@ -69,6 +79,7 @@ class RebotB601Follower(Robot):
      config_class = RebotB601FollowerRobotConfig
      name = "rebot_b601_follower"
      supports_position_hold = True
@@ -371,7 +677,7 @@ index 468280d1..fb8b4aa5 100644
      calibration: dict[str, MotorCalibration]
  
      def __init__(self, config: RebotB601FollowerRobotConfig):
-@@ -90,6 +98,52 @@ class RebotB601Follower(Robot):
+@@ -90,6 +101,54 @@ class RebotB601Follower(Robot):
          self._gripper_prev_target_vel: float | None = None
          self._gripper_prev_state_pos: float | None = None
          self._gripper_prev_time: float | None = None
@@ -396,8 +702,10 @@ index 468280d1..fb8b4aa5 100644
 +        self._timeout_at = None
 +        self._tau_peak = dict.fromkeys(self.motor_names, 0.0)
 +        self._tau_last = dict.fromkeys(self.motor_names, 0.0)
-+        self._telemetry = None
 +        self._telemetry_at = 0.0
++        self._diagnostics: DiagnosticsRecorder | None = None
++        self._diagnostic_batch: list[dict[str, Any]] | None = None
++        self._last_leader: dict[str, Any] | None = None
 +        if config.gravity_comp:
 +            self._gravity = GravityCompensator(
 +                urdf_path=cast(str, config.gravity_urdf_path),
@@ -424,7 +732,7 @@ index 468280d1..fb8b4aa5 100644
  
      @property
      def _motors_ft(self) -> dict[str, type]:
-@@ -116,9 +170,14 @@ class RebotB601Follower(Robot):
+@@ -116,9 +175,14 @@ class RebotB601Follower(Robot):
  
      @property
      def is_connected(self) -> bool:
@@ -440,7 +748,7 @@ index 468280d1..fb8b4aa5 100644
          if self.config.control_mode is ArmControlMode.POS_VEL:
              missing = [
                  motor_name
-@@ -139,49 +198,66 @@ class RebotB601Follower(Robot):
+@@ -139,49 +203,67 @@ class RebotB601Follower(Robot):
      @check_if_already_connected
      def connect(self, calibrate: bool = True) -> None:
          self._validate_control_config()
@@ -504,20 +812,23 @@ index 468280d1..fb8b4aa5 100644
 +                else self.bus.add_robstride_motor
              )
 -            self.calibrate()
-+            for motor_name, (send_id, recv_id) in self._motor_can_ids.items():
-+                self.motors[motor_name] = add_motor(send_id, recv_id, self.profile.motor_models[motor_name])
- 
+-
 -        for cam in self.cameras.values():
 -            cam.connect()
-+            self._reset_gripper_impedance_state()
- 
+-
 -        self.configure()
++            for motor_name, (send_id, recv_id) in self._motor_can_ids.items():
++                self.motors[motor_name] = add_motor(send_id, recv_id, self.profile.motor_models[motor_name])
++
++            self._reset_gripper_impedance_state()
++
 +            # calibrate=False is a passive connection for explicit zeroing/debugging.
 +            if calibrate:
 +                for cam in self.cameras.values():
 +                    cam.connect()
 +                self.configure()
-+        except BaseException:
++        except BaseException as error:
++            self._diagnostic_fault("connect_failure", error=str(error), traceback=traceback.format_exc())
 +            if self.bus is not None:
 +                self.disconnect()
 +            raise
@@ -537,18 +848,20 @@ index 468280d1..fb8b4aa5 100644
          if self.calibration:
              user_input = input(
                  f"Press ENTER to use provided calibration file associated with the id {self.id}, "
-@@ -226,7 +302,10 @@ class RebotB601Follower(Robot):
+@@ -226,7 +308,12 @@ class RebotB601Follower(Robot):
          if self.bus is None:
              raise DeviceNotConnectedError(f"{self} motor bus is not initialized")
          self._validate_control_config()
 +        if self._worker is not None and self._worker.is_alive():
 +            raise RuntimeError("Cannot reconfigure an active motor loop")
++        self._open_telemetry()
++        self._diagnostic_event("state", state="configuring", motors_enabled=self._enabled)
          self.bus.disable_all()
 +        self._enabled = False
          for motor_name, motor in self.motors.items():
              if motor_name == GRIPPER_MOTOR:
                  if self.config.gripper_control_mode is GripperControlMode.FORCE_POS:
-@@ -239,18 +318,56 @@ class RebotB601Follower(Robot):
+@@ -239,41 +326,546 @@ class RebotB601Follower(Robot):
                  target_mode = MotorBridgeMode.MIT
  
              motor.ensure_mode(target_mode)
@@ -583,9 +896,9 @@ index 468280d1..fb8b4aa5 100644
 +        self._transmit(self._targets, states)
          self.bus.enable_all()
 +        self._enabled = True
++        self._diagnostic_event("state", state="enabled", motors_enabled=True)
 +        self._transmit(self._targets, states)
 +        if self.config.background_control:
-+            self._open_telemetry()
 +            self._worker = threading.Thread(target=self._control_loop, name="b601-control", daemon=True)
 +            self._worker.start()
  
@@ -606,7 +919,34 @@ index 468280d1..fb8b4aa5 100644
          """Request and return the latest motor states from MotorBridge."""
          if self.bus is None:
              raise DeviceNotConnectedError(f"{self} motor bus is not initialized")
-@@ -263,17 +380,313 @@ class RebotB601Follower(Robot):
+         try:
++            poll_started_ns = time.monotonic_ns()
+             for motor in self.motors.values():
+                 motor.request_feedback()
+             self.bus.poll_feedback_once()
+ 
+             states = {motor_name: motor.get_state() for motor_name, motor in self.motors.items()}
++            self._diagnostic_event(
++                "feedback",
++                host_poll_started_ns=poll_started_ns,
++                host_poll_completed_ns=time.monotonic_ns(),
++                motor_rx_timestamp_available=False,
++                joints={
++                    name: None
++                    if st is None
++                    else {
++                        "pos_rad": st.pos,
++                        "vel_rad_s": st.vel,
++                        "measured_torque_nm": st.torq,
++                        "t_mos_c": st.t_mos,
++                        "t_rotor_c": st.t_rotor,
++                        "status": st.status_code,
++                        "rx_mono_ns": None,
++                        "rx_sequence": None,
++                    }
++                    for name, st in states.items()
++                },
++            )
              unavailable = [motor_name for motor_name, state in states.items() if state is None]
              if unavailable:
                  raise RuntimeError(f"No motor feedback available for: {', '.join(unavailable)}.")
@@ -692,6 +1032,7 @@ index 468280d1..fb8b4aa5 100644
 +
 +    def on_comm_loss(self, reason: str) -> bool:
 +        """Called by the teleop/record loops when the leader stream fails. True if homing started."""
++        self._diagnostic_fault("leader_link_lost", reason=reason, leader=self._last_leader)
 +        if self.config.comm_loss_action != "home":
 +            return False
 +        return self.go_home(reason)
@@ -710,6 +1051,7 @@ index 468280d1..fb8b4aa5 100644
 +                logger.error("Cannot return to zero: motor loop is not running (%s)", reason)
 +                return False
 +            self._homing, self._home_done = True, False
++            self._diagnostic_event("state", state="homing", reason=reason, targets=self._targets.copy())
 +            self._home_t = time.monotonic()
 +            self._command_at = None
 +            self._target_velocity = dict.fromkeys(self.motor_names, 0.0)
@@ -740,6 +1082,12 @@ index 468280d1..fb8b4aa5 100644
 +            reached = reached and abs(target - goal) < 0.05
 +        if reached and not self._home_done:
 +            self._home_done = True
++            self._diagnostic_event(
++                "state",
++                state="home_setpoint_reached",
++                measured_arrival_confirmed=False,
++                targets=self._targets.copy(),
++            )
 +            logger.warning("Arm reached the set-zero pose; holding there.")
 +
 +    @staticmethod
@@ -758,11 +1106,18 @@ index 468280d1..fb8b4aa5 100644
 +        """Latch measured position hold; keep gravity refresh in the motor worker."""
 +        with self._io_lock:
 +            if self._homing:  # homing owns the targets; do not cancel it
++                self._diagnostic_event("state", state="hold_ignored_during_home")
 +                return
 +            if self._states is not None:
 +                self._targets = self._present_pos(self._states)
 +                self._target_velocity = dict.fromkeys(self.motor_names, 0.0)
 +            self._command_at = None
++            self._diagnostic_event(
++                "state",
++                state="holding",
++                targets=self._targets.copy(),
++                pending_home=self._timeout_at is not None,
++            )
 +
 +    def _control_loop(self):
 +        period = 1.0 / self.config.control_rate_hz
@@ -781,15 +1136,26 @@ index 468280d1..fb8b4aa5 100644
 +                        # A single dropped CAN frame must not drop the arm: the motors keep
 +                        # their last command. Give up (and disable) only if it persists.
 +                        feedback_failures += 1
++                        self._diagnostic_event(
++                            "feedback_error",
++                            failure_count=feedback_failures,
++                            error=str(feedback_error),
++                            traceback=traceback.format_exc(),
++                        )
++                        if feedback_failures == 1:
++                            self._diagnostic_fault("feedback_error", error=str(feedback_error))
 +                        if feedback_failures > _FEEDBACK_FAILURES_TOLERATED:
 +                            raise
 +                        logger.warning(
 +                            "Motor feedback missed (%d/%d): %s",
-+                            feedback_failures, _FEEDBACK_FAILURES_TOLERATED, feedback_error,
++                            feedback_failures,
++                            _FEEDBACK_FAILURES_TOLERATED,
++                            feedback_error,
 +                        )
 +                        self._worker_stop.wait(max(0.0005, period - (time.monotonic() - started)))
 +                        continue
 +                    if started - last_cycle > self.config.command_timeout_s:
++                        self._diagnostic_fault("motor_loop_deadline", gap_s=started - last_cycle)
 +                        self.hold()
 +                        if self.config.comm_loss_action == "home":
 +                            self.go_home("motor loop missed its deadline")
@@ -797,15 +1163,37 @@ index 468280d1..fb8b4aa5 100644
 +                            self._control_error = "motor loop missed its deadline; holding measured position"
 +                    if started - self._last_probe >= self.config.feedback_probe_interval_s:
 +                        motor = self.motors[self.motor_names[self._probe_index % len(self.motor_names)]]
-+                        motor.damiao_get_param_u32(0x0A, timeout_ms=50)
++                        probe_joint = self.motor_names[self._probe_index % len(self.motor_names)]
++                        probe_started_ns = time.monotonic_ns()
++                        try:
++                            value = motor.damiao_get_param_u32(0x0A, timeout_ms=50)
++                        except Exception as error:
++                            self._diagnostic_event(
++                                "parameter_probe_error",
++                                joint=probe_joint,
++                                parameter=0x0A,
++                                timeout_ms=50,
++                                error=str(error),
++                            )
++                            raise
++                        self._diagnostic_event(
++                            "parameter_probe",
++                            joint=probe_joint,
++                            parameter=0x0A,
++                            value=value,
++                            started_ns=probe_started_ns,
++                            completed_ns=time.monotonic_ns(),
++                        )
 +                        self._probe_index += 1
 +                        self._last_probe = time.monotonic()
 +                    if (
 +                        self._command_at is not None
 +                        and started - self._command_at > self.config.command_timeout_s
 +                    ):
++                        command_age = started - self._command_at
 +                        self.hold()
 +                        self._control_error = "target update timeout; holding measured position"
++                        self._diagnostic_fault("target_timeout", age_s=command_age)
 +                        self._timeout_at = time.monotonic()
 +                        logger.error(self._control_error)
 +                    if (
@@ -818,13 +1206,23 @@ index 468280d1..fb8b4aa5 100644
 +                    if self._homing:
 +                        self._advance_home(time.monotonic())
 +                    if time.monotonic() - started > self.config.command_timeout_s:
-+                        if self.config.comm_loss_action == "home" and self.go_home("motor I/O cycle too slow"):
++                        self._diagnostic_fault("motor_io_deadline", duration_s=time.monotonic() - started)
++                        if self.config.comm_loss_action == "home" and self.go_home(
++                            "motor I/O cycle too slow"
++                        ):
 +                            pass
 +                        else:
 +                            raise RuntimeError("Motor I/O cycle exceeded the watchdog deadline")
 +                    if not self._worker_stop.is_set():
 +                        self._transmit(self._targets, states)
 +                        self._write_telemetry(states)
++                    self._diagnostic_event(
++                        "control_cycle",
++                        started_mono_ns=int(started * 1e9),
++                        duration_s=time.monotonic() - started,
++                        homing=self._homing,
++                        enabled=self._enabled,
++                    )
 +                    last_cycle = time.monotonic()
 +                    cycles += 1
 +                    if last_cycle - window_started >= 5.0:
@@ -833,6 +1231,8 @@ index 468280d1..fb8b4aa5 100644
 +                            "B601 motor loop: %.1f Hz (requested %.1f)", rate, self.config.control_rate_hz
 +                        )
 +                        self._log_telemetry(states)
++                        if self._diagnostics is not None:
++                            logger.info("B601 diagnostics health: %s", self._diagnostics.status())
 +                        if rate < 0.7 * self.config.control_rate_hz:
 +                            logger.warning(
 +                                "Motor loop is below its requested rate; validate bus timing before collection"
@@ -840,10 +1240,17 @@ index 468280d1..fb8b4aa5 100644
 +                        window_started, cycles = last_cycle, 0
 +            except BaseException as error:
 +                self._control_error = str(error)
++                self._diagnostic_fault(
++                    "control_failure",
++                    error_type=type(error).__name__,
++                    error=str(error),
++                    traceback=traceback.format_exc(),
++                )
 +                logger.critical("Motor feedback/control failure. Support the arm immediately: %s", error)
 +                try:
 +                    self.bus.disable_all()
 +                    self._enabled = False
++                    self._diagnostic_event("state", state="disabled_after_control_failure")
 +                except Exception:
 +                    logger.exception("Failed to disable motors; hardware CAN watchdog is the fallback")
 +                finally:
@@ -852,20 +1259,77 @@ index 468280d1..fb8b4aa5 100644
 +            self._worker_stop.wait(max(0.0005, period - (time.monotonic() - started)))
 +
 +    def _open_telemetry(self) -> None:
-+        if not self.config.telemetry_dir:
++        if not self.config.telemetry_dir or self._diagnostics is not None:
 +            return
-+        folder = Path(self.config.telemetry_dir).expanduser()
-+        folder.mkdir(parents=True, exist_ok=True)
-+        path = folder / time.strftime("b601_%Y%m%d_%H%M%S.csv")
-+        self._telemetry = open(path, "w", buffering=1)  # line buffered: survives a kill
-+        columns = ["t"] + [f"{n}_{k}" for n in self.motor_names for k in ("target", "pos", "vel", "tau", "temp")]
-+        columns += ["homing", "error"]
-+        self._telemetry.write(",".join(columns) + "\n")
-+        logger.info("B601 telemetry: %s", path)
++        try:
++            self._diagnostics = DiagnosticsRecorder(
++                self.config.telemetry_dir,
++                metadata={
++                    "control": self.control_metadata(),
++                    "repository_commit": os.environ.get("TELEOP_REPO_COMMIT"),
++                    "control_patch_sha256": os.environ.get("TELEOP_PATCH_SHA256"),
++                    "source_files": [
++                        str(Path(__file__).resolve()),
++                        str(Path(__file__).with_name("gravity.py")),
++                        str(Path(__file__).with_name("diagnostics.py")),
++                        str(Path(__file__).with_name("config_rebot_b601_follower.py")),
++                        str(Path(__file__).parents[2] / "teleoperators/rebot_102_leader/rebot_102_leader.py"),
++                        str(Path(__file__).parents[2] / "scripts/lerobot_teleoperate.py"),
++                        str(Path(__file__).parents[2] / "scripts/lerobot_record.py"),
++                    ],
++                },
++                pre_seconds=self.config.diagnostic_pre_seconds,
++                post_seconds=self.config.diagnostic_post_seconds,
++            )
++            self._diagnostic_event("session", requested_rate_hz=self.config.control_rate_hz)
++            logger.info("B601 diagnostics (async): %s", self.config.telemetry_dir)
++        except Exception as error:
++            logger.warning("Diagnostics unavailable; motor policy unchanged: %s", error)
++
++    def _diagnostic_event(self, kind: str, **payload: Any) -> None:
++        if self._diagnostics is not None:
++            self._diagnostics.emit(kind, payload)
++
++    def _diagnostic_fault(self, code: str, **payload: Any) -> None:
++        if self._diagnostics is not None:
++            self._diagnostics.trigger(code, {"enabled": self._enabled, "homing": self._homing, **payload})
++
++    def record_leader_input(self, action: dict[str, float] | None, details: dict | None = None) -> None:
++        self._last_leader = {"action_deg": dict(action) if action is not None else None, "read": details}
++        self._diagnostic_event("leader_input", **self._last_leader)
++
++    def _submit_motor_command(self, name: str, method: str, *args: float) -> None:
++        if self._diagnostics is None:
++            getattr(self.motors[name], method)(*args)
++            return
++        fields = {
++            "send_mit": ("position_rad", "velocity_rad_s", "kp", "kd", "tau_ff_nm"),
++            "send_pos_vel": ("position_rad", "velocity_limit_rad_s"),
++            "send_force_pos": ("position_rad", "velocity_limit_rad_s", "torque_ratio"),
++        }[method]
++        command = {
++            "joint": name,
++            "method": method,
++            "parameters": dict(zip(fields, args, strict=True)),
++            "attempt_mono_ns": time.monotonic_ns(),
++            "transport_returned": False,
++        }
++        try:
++            getattr(self.motors[name], method)(*args)
++            command["transport_returned"] = True
++        except BaseException as error:
++            command["error"] = f"{type(error).__name__}: {error}"
++            raise
++        finally:
++            command["completed_mono_ns"] = time.monotonic_ns()
++            if self._diagnostic_batch is not None:
++                self._diagnostic_batch.append(command)
++            else:
++                self._diagnostic_event("motor_commands", commands=[command], execution_acknowledged=False)
 +
 +    def _write_telemetry(self, states) -> None:
 +        now = time.monotonic()
-+        if self._telemetry is None or now - self._telemetry_at < 0.1:
++        if self._diagnostics is None or now - self._telemetry_at < 0.1:
 +            return
 +        self._telemetry_at = now
 +        present = self._present_pos(states)
@@ -880,7 +1344,15 @@ index 468280d1..fb8b4aa5 100644
 +                f"{max(st.t_mos, st.t_rotor):.0f}",
 +            ]
 +        row += [str(int(self._homing)), (self._control_error or "").replace(",", ";")]
-+        self._telemetry.write(",".join(row) + "\n")
++        columns = ["t"] + [
++            f"{n}_{k}" for n in self.motor_names for k in ("target", "pos", "vel", "tau", "temp")
++        ]
++        self._diagnostic_event(
++            "telemetry",
++            columns=columns + ["homing", "error"],
++            row=row,
++            torque_kind="estimated_pd_torque_not_measured",
++        )
 +
 +    def _log_telemetry(self, states) -> None:
 +        """5 s summary: hottest motor, worst tracking error, peak torque vs its cap."""
@@ -893,7 +1365,12 @@ index 468280d1..fb8b4aa5 100644
 +        load = max(arm, key=lambda n: self._tau_peak[n] / self.config.mit_total_torque_limit[n])
 +        logger.info(
 +            "B601 status: hottest %s %.0fC | worst tracking %s %+.1f deg | peak torque %s %.1f/%.0f N.m%s",
-+            hot, temp, worst, error, load, self._tau_peak[load],
++            hot,
++            temp,
++            worst,
++            error,
++            load,
++            self._tau_peak[load],
 +            self.config.mit_total_torque_limit[load],
 +            " | HOMING" if self._homing else "",
 +        )
@@ -905,8 +1382,20 @@ index 468280d1..fb8b4aa5 100644
 +            gravity_tau = self._gravity.compute(
 +                {name: states[name].pos for name in self._gravity.joint_names}
 +            )
-+        for name, target in targets.items():
-+            self._send_joint(name, target, states[name], gravity_tau.get(name, 0.0))
++        commands: list[dict[str, Any]] = []
++        self._diagnostic_batch = commands
++        try:
++            for name, target in targets.items():
++                self._send_joint(name, target, states[name], gravity_tau.get(name, 0.0))
++        finally:
++            self._diagnostic_batch = None
++            self._diagnostic_event(
++                "motor_commands",
++                commands=commands,
++                public_setpoints_deg=dict(targets),
++                gravity_tau_nm=gravity_tau,
++                execution_acknowledged=False,
++            )
 +
 +    def _gripper_scale(self, motor_name: str) -> float:
 +        # Public gripper range is 0..-270 deg; the motor may travel further (gripper_open_deg).
@@ -922,7 +1411,7 @@ index 468280d1..fb8b4aa5 100644
  
      def _public_to_motor_limits(self, motor_name: str, limits: tuple[float, float]) -> tuple[float, float]:
          motor_limits = tuple(self._public_to_motor_position(motor_name, value) for value in limits)
-@@ -318,29 +731,92 @@ class RebotB601Follower(Robot):
+@@ -318,29 +910,93 @@ class RebotB601Follower(Robot):
          clipped depending on `max_relative_target`, so the action actually sent is
          always returned.
          """
@@ -948,6 +1437,7 @@ index 468280d1..fb8b4aa5 100644
 -
 -    def _send_joint(self, motor_name: str, position_deg: float, state: Any | None = None) -> float:
 -        """Send one joint command and return its clipped public position."""
+-        motor = self.motors[motor_name]
 +        with self._io_lock:
 +            try:
 +                self._check_control()
@@ -958,6 +1448,7 @@ index 468280d1..fb8b4aa5 100644
 +                    for key, value in action.items()
 +                    if key.endswith(".pos")
 +                }
++                self._diagnostic_event("requested_action", goals_deg=goals.copy())
 +                if not goals or any(
 +                    name not in self.motor_names or not math.isfinite(value) for name, value in goals.items()
 +                ):
@@ -1016,6 +1507,7 @@ index 468280d1..fb8b4aa5 100644
 +                self._target_at = self._command_at = now
 +                return {f"{name}.pos": targets[name] for name in goals}
 +            except Exception as error:
++                self._diagnostic_fault("command_error", error=str(error), traceback=traceback.format_exc())
 +                self.hold()
 +                if self.config.comm_loss_action == "home":
 +                    # Do not let the arm go limp: return to the set-zero pose under control.
@@ -1031,27 +1523,34 @@ index 468280d1..fb8b4aa5 100644
 +
 +        ``tau_ff`` is the MIT feed-forward torque in N.m (gravity compensation); arm joints only.
 +        """
-         motor = self.motors[motor_name]
 +        if not math.isfinite(position_deg) or not math.isfinite(tau_ff):
 +            raise ValueError("Non-finite motor target or feed-forward")
  
          # Clip against soft joint limits.
          limits = self._joint_limits.get(motor_name)
-@@ -357,14 +833,35 @@ class RebotB601Follower(Robot):
+@@ -356,31 +1012,67 @@ class RebotB601Follower(Robot):
+         if motor_name == GRIPPER_MOTOR:
              self._send_gripper(position_rad, state)
          elif self.config.control_mode is ArmControlMode.POS_VEL:
-             motor.send_pos_vel(position_rad, math.radians(self._pos_vel_velocity[motor_name]))
+-            motor.send_pos_vel(position_rad, math.radians(self._pos_vel_velocity[motor_name]))
+-        else:
+-            motor.send_mit(
++            self._submit_motor_command(
++                motor_name, "send_pos_vel", position_rad, math.radians(self._pos_vel_velocity[motor_name])
++            )
 +        elif self.config.motor_family is MotorFamily.RS:
 +            # The host torque loop in this change is for DM; preserve RS firmware PD.
-+            motor.send_mit(position_rad, 0.0, self._mit_kp[motor_name], self._mit_kd[motor_name], tau_ff)
-         else:
--            motor.send_mit(
--                position_rad,
++            self._submit_motor_command(
++                motor_name,
++                "send_mit",
+                 position_rad,
+                 0.0,
+                 self._mit_kp[motor_name],
+                 self._mit_kd[motor_name],
 -                0.0,
--                self._mit_kp[motor_name],
--                self._mit_kd[motor_name],
--                0.0,
--            )
++                tau_ff,
+             )
++        else:
 +            if state is None:
 +                raise RuntimeError("MIT torque control requires validated measured position and velocity")
 +            kp, kd = self._mit_kp[motor_name], self._mit_kd[motor_name]
@@ -1072,7 +1571,7 @@ index 468280d1..fb8b4aa5 100644
 +                command = state.pos
 +            if not math.isfinite(command):
 +                raise ValueError("Non-finite MIT position command")
-+            motor.send_mit(command, 0.0, kp, kd, tau_g)
++            self._submit_motor_command(motor_name, "send_mit", command, 0.0, kp, kd, tau_g)
 +            # Expected total torque the firmware PD will produce (monitoring only).
 +            expected = abs(kp * (command - state.pos) - kd * state.vel + tau_g)
 +            self._tau_peak[motor_name] = max(self._tau_peak.get(motor_name, 0.0), expected)
@@ -1080,7 +1579,32 @@ index 468280d1..fb8b4aa5 100644
          return position_deg
  
      def _send_gripper(self, position_rad: float, state: Any | None = None) -> None:
-@@ -446,18 +943,56 @@ class RebotB601Follower(Robot):
+         """Send the gripper command with its configured control mode."""
+-        motor = self.motors[GRIPPER_MOTOR]
+         if self.config.gripper_control_mode is GripperControlMode.FORCE_POS:
+-            motor.send_force_pos(
++            self._submit_motor_command(
++                GRIPPER_MOTOR,
++                "send_force_pos",
+                 position_rad,
+                 math.radians(self._pos_vel_velocity[GRIPPER_MOTOR]),
+                 cast(float, self.config.gripper_torque_ratio),
+             )
+         elif self.config.gripper_control_mode is GripperControlMode.MIT_IMPEDANCE:
+             torque = self._gripper_impedance_torque(position_rad, state)
+-            motor.send_mit(0.0, 0.0, 0.0, _GRIPPER_IMPEDANCE_DAMPING, torque)
++            self._submit_motor_command(
++                GRIPPER_MOTOR, "send_mit", 0.0, 0.0, 0.0, _GRIPPER_IMPEDANCE_DAMPING, torque
++            )
+         else:
+-            motor.send_mit(
++            self._submit_motor_command(
++                GRIPPER_MOTOR,
++                "send_mit",
+                 position_rad,
+                 0.0,
+                 self._mit_kp[GRIPPER_MOTOR],
+@@ -446,18 +1138,57 @@ class RebotB601Follower(Robot):
          """Disconnect motors and cameras from the robot."""
          if self.bus is None:
              raise DeviceNotConnectedError(f"{self} motor bus is not initialized")
@@ -1098,6 +1622,7 @@ index 468280d1..fb8b4aa5 100644
 -            cam.disconnect()
 -
 -        self._reset_gripper_impedance_state()
++        self._diagnostic_event("state", state="disconnect_requested", homing=self._homing)
 +        if self._worker is not None and self._worker.is_alive() and self._enabled:
 +            self.hold()
 +            deadline = time.monotonic() + 120.0
@@ -1140,9 +1665,9 @@ index 468280d1..fb8b4aa5 100644
 +                        logger.exception("Could not close a motor handle")
 +        finally:
 +            self._enabled = False
-+            if self._telemetry is not None:
-+                self._telemetry.close()
-+                self._telemetry = None
++            self._diagnostic_event("state", state="disconnecting_bus", motors_enabled=False)
++            if self._diagnostics is not None:
++                self._diagnostics.close()
 +            self.bus.close()
 +            self.bus = None
 +            self.motors = {}
@@ -1152,10 +1677,10 @@ index 468280d1..fb8b4aa5 100644
 +            self._reset_gripper_impedance_state()
          logger.info(f"{self} disconnected.")
 diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
-index 69ed900b..26f6d3f7 100644
+index 69ed900b..544c1f9c 100644
 --- a/src/lerobot/scripts/lerobot_record.py
 +++ b/src/lerobot/scripts/lerobot_record.py
-@@ -298,96 +298,115 @@ def record_loop(
+@@ -298,96 +298,119 @@ def record_loop(
      no_action_count = 0
      timestamp = 0.0
      start_episode_t = time.perf_counter()
@@ -1202,10 +1727,14 @@ index 69ed900b..26f6d3f7 100644
 +                    try:
 +                        act = teleop.get_action()
 +                    except Exception as error:
++                        if hasattr(robot, "record_leader_input"):
++                            robot.record_leader_input(None, getattr(teleop, "last_diagnostic", None))
 +                        # Leader link lost: let the follower return to its zero pose if configured.
 +                        if hasattr(robot, "on_comm_loss"):
 +                            robot.on_comm_loss(f"leader read failed: {error}")
 +                        raise
++                    if hasattr(robot, "record_leader_input"):
++                        robot.record_leader_input(act, getattr(teleop, "last_diagnostic", None))
 +                    if robot.name == "unitree_g1":
 +                        teleop.send_feedback(obs)
 +
@@ -1355,7 +1884,7 @@ index 69ed900b..26f6d3f7 100644
  
  
  @parser.wrap()
-@@ -492,6 +511,11 @@ def record(
+@@ -492,6 +515,11 @@ def record(
                  encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
              )
  
@@ -1367,7 +1896,7 @@ index 69ed900b..26f6d3f7 100644
          # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
          # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
          if teleop is not None:
-@@ -569,19 +593,25 @@ def record(
+@@ -569,19 +597,25 @@ def record(
                  timer.log_episode_summary(f"episode {episode_index}")
                  timer.restart()
      finally:
@@ -1407,10 +1936,10 @@ index 69ed900b..26f6d3f7 100644
          if listener is not None:
              listener.stop()
 diff --git a/src/lerobot/scripts/lerobot_teleoperate.py b/src/lerobot/scripts/lerobot_teleoperate.py
-index b0f65f5b..859e7040 100644
+index b0f65f5b..4ba30c90 100644
 --- a/src/lerobot/scripts/lerobot_teleoperate.py
 +++ b/src/lerobot/scripts/lerobot_teleoperate.py
-@@ -210,7 +210,13 @@ def teleop_loop(
+@@ -210,7 +210,18 @@ def teleop_loop(
  
              with timer.section("teleop"):
                  # Get teleop action
@@ -1418,14 +1947,19 @@ index b0f65f5b..859e7040 100644
 +                try:
 +                    raw_action = teleop.get_action()
 +                except Exception as error:
++                    if hasattr(robot, "record_leader_input"):
++                        robot.record_leader_input(None, getattr(teleop, "last_diagnostic", None))
 +                    # Leader link lost: let the follower return to its zero pose if configured.
 +                    if hasattr(robot, "on_comm_loss"):
 +                        robot.on_comm_loss(f"leader read failed: {error}")
 +                    raise
++
++                if hasattr(robot, "record_leader_input"):
++                    robot.record_leader_input(raw_action, getattr(teleop, "last_diagnostic", None))
  
                  # Process teleop action through pipeline
                  teleop_action = teleop_action_processor((raw_action, obs))
-@@ -254,6 +260,8 @@ def teleop_loop(
+@@ -254,6 +265,8 @@ def teleop_loop(
              if duration is not None and time.perf_counter() - start >= duration:
                  return
      finally:
@@ -1434,7 +1968,7 @@ index b0f65f5b..859e7040 100644
          # In `finally` so ^C — how a teleop session normally ends — still reports.
          timer.log_run_summary()
  
-@@ -277,10 +285,9 @@ def teleoperate(cfg: TeleoperateConfig):
+@@ -277,10 +290,9 @@ def teleoperate(cfg: TeleoperateConfig):
      check_control_rate(robot, cfg.fps, "--fps")
      teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
  
@@ -1447,7 +1981,7 @@ index b0f65f5b..859e7040 100644
          teleop_loop(
              teleop=teleop,
              robot=robot,
-@@ -298,8 +305,12 @@ def teleoperate(cfg: TeleoperateConfig):
+@@ -298,8 +310,12 @@ def teleoperate(cfg: TeleoperateConfig):
      finally:
          if cfg.display_data:
              shutdown_visualization(cfg.display_mode)
@@ -1475,7 +2009,7 @@ index 81a1c2c3..869ff6da 100644
      # Servo id of each joint on the UART bus.
      joint_ids: dict[str, int] = field(
 diff --git a/src/lerobot/teleoperators/rebot_102_leader/rebot_102_leader.py b/src/lerobot/teleoperators/rebot_102_leader/rebot_102_leader.py
-index e557991b..f5f722ec 100644
+index e557991b..3cb630bd 100644
 --- a/src/lerobot/teleoperators/rebot_102_leader/rebot_102_leader.py
 +++ b/src/lerobot/teleoperators/rebot_102_leader/rebot_102_leader.py
 @@ -15,6 +15,7 @@
@@ -1486,7 +2020,7 @@ index e557991b..f5f722ec 100644
  import time
  from typing import TYPE_CHECKING
  
-@@ -53,6 +54,8 @@ class RebotArm102Leader(Teleoperator):
+@@ -53,9 +54,12 @@ class RebotArm102Leader(Teleoperator):
          require_package("motorbridge-smart-servo", extra="rebot", import_name="motorbridge_smart_servo")
          super().__init__(config)
          self.config = config
@@ -1495,7 +2029,11 @@ index e557991b..f5f722ec 100644
          self.bus: FashionStarServo | None = None
          self.motor_names = list(config.joint_ids.keys())
          self._last_raw_positions: dict[str, float] = {}
-@@ -71,6 +74,10 @@ class RebotArm102Leader(Teleoperator):
++        self.last_diagnostic: dict = {}
+ 
+     @property
+     def action_features(self) -> dict[str, type]:
+@@ -71,6 +75,10 @@ class RebotArm102Leader(Teleoperator):
  
      @check_if_already_connected
      def connect(self, calibrate: bool = True) -> None:
@@ -1506,7 +2044,7 @@ index e557991b..f5f722ec 100644
          logger.info(f"Connecting {self} on {self.config.port}...")
          bus = FashionStarServo(self.config.port, baudrate=self.config.baudrate)
          try:
-@@ -80,13 +87,9 @@ class RebotArm102Leader(Teleoperator):
+@@ -80,13 +88,9 @@ class RebotArm102Leader(Teleoperator):
                  self._last_raw_positions[motor_name] = 0.0
              self.bus = bus
  
@@ -1523,7 +2061,7 @@ index e557991b..f5f722ec 100644
          except Exception:
              bus.close()
              self.bus = None
-@@ -96,7 +99,10 @@ class RebotArm102Leader(Teleoperator):
+@@ -96,7 +100,10 @@ class RebotArm102Leader(Teleoperator):
  
      @property
      def is_calibrated(self) -> bool:
@@ -1535,7 +2073,7 @@ index e557991b..f5f722ec 100644
  
      def calibrate(self) -> None:
          if self.calibration:
-@@ -141,21 +147,28 @@ class RebotArm102Leader(Teleoperator):
+@@ -141,21 +148,45 @@ class RebotArm102Leader(Teleoperator):
          for motor_id in self.config.joint_ids.values():
              self.bus.unlock(motor_id)
              time.sleep(_SETTLE_SEC)
@@ -1550,6 +2088,12 @@ index e557991b..f5f722ec 100644
 -        result: dict[int, ServoMonitor | None] = self.bus.sync_monitor(list(self.config.joint_ids.values()))
 -        id_to_name = {v: k for k, v in self.config.joint_ids.items()}
 +        started = time.monotonic()
++        self.last_diagnostic = {
++            "host_read_started_ns": time.monotonic_ns(),
++            "samples": {},
++            "joint_ids": dict(self.config.joint_ids),
++            "joint_directions": dict(self.config.joint_directions),
++        }
          raw_positions: dict[str, float] = {}
 -        for motor_id, monitor in result.items():
 -            motor_name = id_to_name[motor_id]
@@ -1557,7 +2101,17 @@ index e557991b..f5f722ec 100644
 -                raise RuntimeError(f"Servo {motor_name} (id={motor_id}) has never responded.")
 -            raw_positions[motor_name] = monitor.angle_deg
 +        for name, motor_id in self.config.joint_ids.items():
++            self.last_diagnostic["reading_joint"] = name
++            sample_started_ns = time.monotonic_ns()
 +            sample = self.bus.read_angle(motor_id, multi_turn=True)
++            self.last_diagnostic["samples"][name] = {
++                "raw_deg": sample.raw_deg,
++                "filtered_deg": sample.filtered_deg,
++                "reliable": sample.reliable,
++                "host_read_started_ns": sample_started_ns,
++                "host_read_completed_ns": time.monotonic_ns(),
++                "motor_rx_mono_ns": None,
++            }
 +            if not math.isfinite(sample.raw_deg) or not math.isfinite(sample.filtered_deg):
 +                raise RuntimeError(f"Non-finite leader angle: {name}")
 +            angle = sample.filtered_deg
@@ -1571,10 +2125,11 @@ index e557991b..f5f722ec 100644
 +            raw_positions[name] = angle
 +        if time.monotonic() - started > self.config.read_timeout_s:
 +            raise RuntimeError("Leader read deadline exceeded")
++        self.last_diagnostic["host_read_completed_ns"] = time.monotonic_ns()
          return raw_positions
  
      @staticmethod
-@@ -174,16 +187,14 @@ class RebotArm102Leader(Teleoperator):
+@@ -174,16 +205,14 @@ class RebotArm102Leader(Teleoperator):
      @check_if_not_connected
      def get_action(self) -> RobotAction:
          start = time.perf_counter()

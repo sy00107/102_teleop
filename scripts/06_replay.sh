@@ -3,7 +3,7 @@
 # 사용: ./scripts/06_replay.sh [에피소드 번호, 기본 0]
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 EP="${1:-0}"
-lerobot-replay \
+run_with_diagnostics -- lerobot-replay \
   "${ROBOT_ARGS[@]}" \
   --dataset.repo_id="local/$DATASET_NAME" \
   --dataset.root="$YOIDLE_HOME/datasets/$DATASET_NAME" \

@@ -3,6 +3,15 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_conda.sh"
 conda activate "$CONDA_ENV"
+export PYTHONPATH="$LEROBOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+export TELEOP_SESSION_ID="$(date +%Y%m%d_%H%M%S)_$$"
+export TELEOP_DIAGNOSTICS_DIR="$YOIDLE_ROOT/outputs/diagnostics/$TELEOP_SESSION_ID"
+export TELEOP_REPO_COMMIT="$(git -C "$YOIDLE_ROOT" rev-parse HEAD 2>/dev/null || true)"
+export TELEOP_PATCH_SHA256="$(sha256sum "$YOIDLE_ROOT/patches/rebot_b601_gravity_ff.patch" | cut -d ' ' -f 1)"
+
+run_with_diagnostics() {
+  python "$YOIDLE_ROOT/scripts/run_logged.py" --session-dir "$TELEOP_DIAGNOSTICS_DIR" "$@"
+}
 
 if ! command -v lerobot-teleoperate >/dev/null; then
   echo "lerobot 이 설치되지 않았습니다. 먼저 ./setup.sh 를 실행하세요." >&2
@@ -46,7 +55,7 @@ ROBOT_ARGS+=(
   --robot.gripper_max_velocity_deg_s="${GRIPPER_MAX_VELOCITY_DEG_S:-300}"
   --robot.gripper_max_acceleration_deg_s2="${GRIPPER_MAX_ACCELERATION_DEG_S2:-3000}"
   --robot.gripper_open_deg="${GRIPPER_OPEN_DEG:-270}"
-  --robot.telemetry_dir="$YOIDLE_ROOT/outputs/telemetry"
+  --robot.telemetry_dir="$TELEOP_DIAGNOSTICS_DIR"
   --robot.comm_loss_action="${COMM_LOSS_ACTION:-hold}"
   --robot.comm_loss_home_delay_s="${COMM_LOSS_HOME_DELAY_S:-0.5}"
   --robot.home_velocity_deg_s="${HOME_VELOCITY_DEG_S:-20}"

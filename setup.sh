@@ -28,8 +28,13 @@ fi
 CONTROL_PATCH="$YOIDLE_ROOT/patches/rebot_b601_gravity_ff.patch"
 if git -C "$LEROBOT_DIR" apply --reverse --check "$CONTROL_PATCH" 2>/dev/null; then
   echo "B601 제어 수정이 이미 적용되어 있습니다."
-elif git -C "$LEROBOT_DIR" apply --check "$CONTROL_PATCH"; then
+elif git -C "$LEROBOT_DIR" apply --check "$CONTROL_PATCH" 2>/dev/null; then
   git -C "$LEROBOT_DIR" apply "$CONTROL_PATCH"
+elif git -C "$LEROBOT_DIR" apply --reverse --check "$YOIDLE_ROOT/patches/previous/rebot_b601_gravity_ff.ff565db.patch" 2>/dev/null; then
+  python "$YOIDLE_ROOT/scripts/upgrade_control_patch.py" \
+    --repo "$LEROBOT_DIR" \
+    --previous "$YOIDLE_ROOT/patches/previous/rebot_b601_gravity_ff.ff565db.patch" \
+    --current "$CONTROL_PATCH"
 else
   echo "기존 수정과 B601 패치가 충돌합니다. 작업 파일을 덮어쓰지 않고 중단합니다." >&2
   exit 1
